@@ -2012,6 +2012,10 @@ struct ContentView: View {
     // MARK: - Stop and Process Transcription
 
     private func stopAndProcessTranscription(route: DictationOutputRoute = .normal) async {
+        // Recording session is ending: release dictation intent so the batch arbiter
+        // (and any dictation restart) no longer sees dictation as active.
+        FileTranscriptionSession.shared.endDictationIntent()
+
         DebugLogger.shared.debug("stopAndProcessTranscription called", source: "ContentView")
         DebugLogger.shared.info("Output route selected: \(route.rawValue)", source: "ContentView")
         self.appBench("stop_path_enter route=\(route.rawValue)")
@@ -3039,12 +3043,16 @@ struct ContentView: View {
         // File-transcription batches drive the same shared ASR model; starting
         // dictation mid-batch would run concurrent inference through one model.
         guard !FileTranscriptionSession.isBatchTranscribing else {
-            DebugLogger.shared.warning(
-                "Dictation blocked: batch file transcription in progress",
-                source: "ContentView"
-            )
+            self.notifyDictationBlockedByBatch()
             return
         }
+
+        // Signal dictation intent synchronously, before any `await` below, so the
+        // batch transcribe closure's arbitration check (which also reads this flag)
+        // cannot race a window where neither isBatchTranscribing nor asr.isRunning
+        // is true yet.
+        FileTranscriptionSession.shared.beginDictationIntent()
+
         let model = SettingsStore.shared.selectedSpeechModel
         DebugLogger.shared.info(
             "ContentView: startRecording() for model=\(model.displayName), supportsStreaming=\(model.supportsStreaming)",
@@ -3076,6 +3084,7 @@ struct ContentView: View {
             })
             if !self.asr.isRunning {
                 self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")
+                FileTranscriptionSession.shared.endDictationIntent()
             }
         }
 
@@ -3310,6 +3319,12 @@ struct ContentView: View {
                 self.menuBarManager.setOverlayMode(.command)
 
                 guard !self.asr.isRunning else { return }
+                // Command mode starts recording directly (it does not route through
+                // beginDictationRecording), so it needs its own batch guard.
+                guard !FileTranscriptionSession.isBatchTranscribing else {
+                    self.notifyDictationBlockedByBatch()
+                    return
+                }
 
                 self.advanceOverlayLifecycle()
 
@@ -3350,6 +3365,12 @@ struct ContentView: View {
                 self.setActiveRecordingMode(.edit)
 
                 guard !self.asr.isRunning else { return }
+                // Rewrite/edit mode starts recording directly (it does not route through
+                // beginDictationRecording), so it needs its own batch guard.
+                guard !FileTranscriptionSession.isBatchTranscribing else {
+                    self.notifyDictationBlockedByBatch()
+                    return
+                }
 
                 self.advanceOverlayLifecycle()
 
@@ -3668,6 +3689,13 @@ extension ContentView {
     }
 
     private func beginDictationRecording(for slot: SettingsStore.DictationShortcutSlot, mode: ActiveRecordingMode) {
+        // Common chokepoint for dictate/prompt/command/rewrite hotkeys: file-transcription
+        // batches drive the same shared ASR model, so none of these modes may start
+        // while a batch is running.
+        guard !FileTranscriptionSession.isBatchTranscribing else {
+            self.notifyDictationBlockedByBatch()
+            return
+        }
         DebugLogger.shared.debug("Begin dictation recording for slot \(slot.rawValue)", source: "ContentView")
         self.appBench("begin_recording slot=\(slot.rawValue) mode=\(mode.rawValue)")
         if self.isOnboardingVoicePlaygroundStepActive {
@@ -3715,6 +3743,18 @@ extension ContentView {
         let settings = SettingsStore.shared
         settings.setDictationPromptSelection(selection, for: .secondary)
         self.beginDictationRecording(for: .secondary, mode: mode)
+    }
+
+    /// Feedback when a dictation-family hotkey (dictate/prompt/command/rewrite) is
+    /// rejected because a file-transcription batch is running. Reuses the existing
+    /// stop cue rather than building new UI, so the user gets an audible signal that
+    /// the hotkey press had no effect instead of silence.
+    private func notifyDictationBlockedByBatch() {
+        DebugLogger.shared.warning(
+            "Dictation blocked: batch file transcription in progress",
+            source: "ContentView"
+        )
+        TranscriptionSoundPlayer.shared.playStopSound()
     }
 
     private func appBench(_ message: String) {
